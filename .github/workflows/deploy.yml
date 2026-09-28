@@ -1,0 +1,337 @@
+# Trigger từ GitLab CI:
+#   POST https://api.github.com/repos/<owner>/<repo>/dispatches
+#   {"event_type":"deploy","client_payload":{"tag":"v1.2.0+15-prod","platform":"both"}}
+#
+# Tag: v<version>+<build_number>-<dev|prod>
+# platform: ios | android | both (mặc định both)
+# android_track: internal | alpha | beta | production (mặc định internal)
+
+name: Build & Deploy
+
+on:
+  repository_dispatch:
+    types: [deploy]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag trên GitLab, vd v1.2.0+15-prod"
+        required: false
+      platform:
+        type: choice
+        default: both
+        options: [both, ios, android]
+      android_track:
+        type: choice
+        default: internal
+        options: [internal, alpha, beta, production]
+      init_certs:
+        description: "Chạy một lần đầu: tạo certificate + profile iOS bằng match"
+        type: boolean
+        default: false
+
+env:
+  APPLE_TEAM_ID: HNVG2MT2JL
+  IOS_BUNDLE_ID: com.example.laboroWorkforceMobile
+  ANDROID_PACKAGE_NAME: com.example.laboro_workforce_mobile
+  JAVA_VERSION: "17"
+
+concurrency:
+  group: deploy-${{ github.event.client_payload.tag || inputs.tag || github.run_id }}
+  cancel-in-progress: true
+
+jobs:
+  params:
+    name: Params
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.parse.outputs.tag }}
+      version: ${{ steps.parse.outputs.version }}
+      build_number: ${{ steps.parse.outputs.build_number }}
+      flavor: ${{ steps.parse.outputs.flavor }}
+      app_env: ${{ steps.parse.outputs.app_env }}
+      platform: ${{ steps.parse.outputs.platform }}
+      android_track: ${{ steps.parse.outputs.android_track }}
+      init_certs: ${{ steps.parse.outputs.init_certs }}
+    steps:
+      - id: parse
+        env:
+          TAG: ${{ github.event.client_payload.tag || inputs.tag }}
+          PLATFORM: ${{ github.event.client_payload.platform || inputs.platform || 'both' }}
+          ANDROID_TRACK: ${{ github.event.client_payload.android_track || inputs.android_track || 'internal' }}
+          INIT_CERTS: ${{ inputs.init_certs || false }}
+        run: |
+          {
+            echo "platform=$PLATFORM"
+            echo "android_track=$ANDROID_TRACK"
+            echo "init_certs=$INIT_CERTS"
+          } >> "$GITHUB_OUTPUT"
+
+          if [ "$INIT_CERTS" = "true" ]; then
+            exit 0
+          fi
+
+          if [[ ! "$TAG" =~ ^v([0-9]+\.[0-9]+\.[0-9]+)\+([0-9]+)-(dev|prod)$ ]]; then
+            echo "::error::Tag không hợp lệ: '$TAG' (đúng định dạng: v1.2.0+15-prod)"
+            exit 1
+          fi
+
+          FLAVOR="${BASH_REMATCH[3]}"
+          {
+            echo "tag=$TAG"
+            echo "version=${BASH_REMATCH[1]}"
+            echo "build_number=${BASH_REMATCH[2]}"
+            echo "flavor=$FLAVOR"
+            echo "app_env=$([ "$FLAVOR" = prod ] && echo production || echo development)"
+          } >> "$GITHUB_OUTPUT"
+
+  android:
+    name: Android
+    needs: params
+    if: needs.params.outputs.init_certs != 'true' && contains(fromJSON('["android","both"]'), needs.params.outputs.platform)
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    env:
+      TAG: ${{ needs.params.outputs.tag }}
+      APP_ENV: ${{ needs.params.outputs.app_env }}
+      VERSION: ${{ needs.params.outputs.version }}
+      BUILD_NUMBER: ${{ needs.params.outputs.build_number }}
+    defaults:
+      run:
+        working-directory: source
+    steps:
+      - name: Clone source từ GitLab
+        working-directory: .
+        env:
+          REPO_URL: https://gitlab-ci-token:${{ secrets.GITLAB_DEPLOY_TOKEN }}@gitlab.com/${{ secrets.GITLAB_REPO_PATH }}.git
+        run: git clone -q --depth 1 --branch "$TAG" "$REPO_URL" source
+
+      - id: fvm
+        run: echo "flutter=$(jq -r .flutter .fvmrc)" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/setup-java@v5
+        with:
+          distribution: zulu
+          java-version: ${{ env.JAVA_VERSION }}
+
+      - uses: subosito/flutter-action@v2
+        with:
+          flutter-version: ${{ steps.fvm.outputs.flutter }}
+          channel: stable
+          cache: true
+
+      - name: Write app config
+        env:
+          CONFIG: ${{ needs.params.outputs.flavor == 'prod' && secrets.ENV_FILE_PROD || secrets.ENV_FILE_DEV }}
+        run: |
+          if [ -n "$CONFIG" ]; then
+            printf '%s' "$CONFIG" > "config/$APP_ENV.json"
+          elif [ ! -f "config/$APP_ENV.json" ]; then
+            echo "::error::Thiếu config/$APP_ENV.json và secret ENV_FILE tương ứng đang trống"
+            exit 1
+          fi
+
+      - name: Generate code
+        run: |
+          flutter pub get
+          flutter gen-l10n
+          dart run build_runner build --delete-conflicting-outputs
+
+      - name: Setup signing
+        env:
+          KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        run: |
+          KEYSTORE="$RUNNER_TEMP/upload.jks"
+          echo "$KEYSTORE_BASE64" | base64 -d > "$KEYSTORE"
+          mkdir -p ~/.gradle
+          {
+            echo "android.injected.signing.store.file=$KEYSTORE"
+            echo "android.injected.signing.store.password=$KEYSTORE_PASSWORD"
+            echo "android.injected.signing.key.alias=$KEY_ALIAS"
+            echo "android.injected.signing.key.password=$KEY_PASSWORD"
+          } >> ~/.gradle/gradle.properties
+
+      - name: Build AAB
+        run: |
+          flutter build appbundle --release \
+            --dart-define-from-file="config/$APP_ENV.json" \
+            --build-name="$VERSION" \
+            --build-number="$BUILD_NUMBER"
+
+      - name: Upload to Google Play
+        uses: r0adkll/upload-google-play@v1
+        with:
+          serviceAccountJsonPlainText: ${{ secrets.GOOGLE_PLAY_SERVICE_ACCOUNT_JSON }}
+          packageName: ${{ env.ANDROID_PACKAGE_NAME }}
+          releaseFiles: source/build/app/outputs/bundle/release/app-release.aab
+          track: ${{ needs.params.outputs.android_track }}
+          status: completed
+
+  ios:
+    name: iOS
+    needs: params
+    if: needs.params.outputs.init_certs == 'true' || contains(fromJSON('["ios","both"]'), needs.params.outputs.platform)
+    runs-on: macos-26
+    timeout-minutes: 45
+    env:
+      TAG: ${{ needs.params.outputs.tag }}
+      APP_ENV: ${{ needs.params.outputs.app_env }}
+      VERSION: ${{ needs.params.outputs.version }}
+      BUILD_NUMBER: ${{ needs.params.outputs.build_number }}
+      INIT_CERTS: ${{ needs.params.outputs.init_certs }}
+      ASC_KEY_ID: ${{ secrets.APP_STORE_KEY_ID }}
+      ASC_ISSUER_ID: ${{ secrets.APP_STORE_ISSUER_ID }}
+      ASC_KEY_P8_BASE64: ${{ secrets.APP_STORE_KEY_P8_BASE64 }}
+      MATCH_GIT_URL: ${{ secrets.MATCH_GIT_URL }}
+      MATCH_GIT_BASIC_AUTHORIZATION: ${{ secrets.MATCH_GIT_BASIC_AUTHORIZATION }}
+      MATCH_PASSWORD: ${{ secrets.MATCH_PASSWORD }}
+      FASTLANE_SKIP_UPDATE_CHECK: "1"
+      FASTLANE_HIDE_CHANGELOG: "1"
+    defaults:
+      run:
+        working-directory: source
+    steps:
+      - uses: maxim-lobanov/setup-xcode@v1
+        with:
+          xcode-version: latest-stable
+
+      - name: Clone source từ GitLab
+        if: env.INIT_CERTS != 'true'
+        working-directory: .
+        env:
+          REPO_URL: https://gitlab-ci-token:${{ secrets.GITLAB_DEPLOY_TOKEN }}@gitlab.com/${{ secrets.GITLAB_REPO_PATH }}.git
+        run: git clone -q --depth 1 --branch "$TAG" "$REPO_URL" source
+
+      - name: Write fastlane files
+        working-directory: .
+        run: |
+          mkdir -p source/ios/fastlane
+          cat > source/ios/fastlane/Fastfile <<'RUBY'
+          default_platform(:ios)
+
+          platform :ios do
+            private_lane :asc_key do
+              app_store_connect_api_key(
+                key_id: ENV["ASC_KEY_ID"],
+                issuer_id: ENV["ASC_ISSUER_ID"],
+                key_content: ENV["ASC_KEY_P8_BASE64"],
+                is_key_content_base64: true
+              )
+            end
+
+            private_lane :sync_certs do |options|
+              setup_ci
+              match(
+                type: "appstore",
+                app_identifier: ENV["IOS_BUNDLE_ID"],
+                team_id: ENV["APPLE_TEAM_ID"],
+                readonly: options[:readonly],
+                api_key: asc_key
+              )
+            end
+
+            lane :certs do
+              sync_certs(readonly: false)
+            end
+
+            lane :prepare do
+              sync_certs(readonly: true)
+              update_code_signing_settings(
+                use_automatic_signing: false,
+                path: "Runner.xcodeproj",
+                targets: ["Runner"],
+                team_id: ENV["APPLE_TEAM_ID"],
+                bundle_identifier: ENV["IOS_BUNDLE_ID"],
+                code_sign_identity: "Apple Distribution",
+                profile_name: "match AppStore #{ENV["IOS_BUNDLE_ID"]}"
+              )
+            end
+
+            lane :upload do
+              upload_to_testflight(
+                api_key: asc_key,
+                ipa: Dir["../../build/ios/ipa/*.ipa"].first,
+                skip_waiting_for_build_processing: true
+              )
+            end
+          end
+          RUBY
+
+          cat > source/ios/ExportOptions.plist <<PLIST
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+            <key>method</key><string>app-store-connect</string>
+            <key>teamID</key><string>$APPLE_TEAM_ID</string>
+            <key>signingStyle</key><string>manual</string>
+            <key>provisioningProfiles</key>
+            <dict>
+              <key>$IOS_BUNDLE_ID</key><string>match AppStore $IOS_BUNDLE_ID</string>
+            </dict>
+          </dict>
+          </plist>
+          PLIST
+
+      - uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: "3.3"
+
+      - name: Install fastlane
+        run: gem install fastlane --no-document
+
+      - name: Init certificates
+        if: env.INIT_CERTS == 'true'
+        working-directory: source/ios
+        run: fastlane ios certs
+
+      - id: fvm
+        if: env.INIT_CERTS != 'true'
+        run: echo "flutter=$(jq -r .flutter .fvmrc)" >> "$GITHUB_OUTPUT"
+
+      - uses: subosito/flutter-action@v2
+        if: env.INIT_CERTS != 'true'
+        with:
+          flutter-version: ${{ steps.fvm.outputs.flutter }}
+          channel: stable
+          cache: true
+
+      - name: Write app config
+        if: env.INIT_CERTS != 'true'
+        env:
+          CONFIG: ${{ needs.params.outputs.flavor == 'prod' && secrets.ENV_FILE_PROD || secrets.ENV_FILE_DEV }}
+        run: |
+          if [ -n "$CONFIG" ]; then
+            printf '%s' "$CONFIG" > "config/$APP_ENV.json"
+          elif [ ! -f "config/$APP_ENV.json" ]; then
+            echo "::error::Thiếu config/$APP_ENV.json và secret ENV_FILE tương ứng đang trống"
+            exit 1
+          fi
+
+      - name: Generate code
+        if: env.INIT_CERTS != 'true'
+        run: |
+          flutter pub get
+          flutter gen-l10n
+          dart run build_runner build --delete-conflicting-outputs
+
+      - name: Setup signing
+        if: env.INIT_CERTS != 'true'
+        working-directory: source/ios
+        run: fastlane ios prepare
+
+      - name: Build IPA
+        if: env.INIT_CERTS != 'true'
+        run: |
+          flutter build ipa --release \
+            --dart-define-from-file="config/$APP_ENV.json" \
+            --build-name="$VERSION" \
+            --build-number="$BUILD_NUMBER" \
+            --export-options-plist=ios/ExportOptions.plist
+
+      - name: Upload to TestFlight
+        if: env.INIT_CERTS != 'true'
+        working-directory: source/ios
+        run: fastlane ios upload

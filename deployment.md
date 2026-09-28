@@ -18,6 +18,7 @@ Tài liệu hướng dẫn từ A tới Z cách setup và vận hành pipeline d
 12. [Xử lý lỗi thường gặp](#12-xử-lý-lỗi-thường-gặp)
 13. [Bảo mật & bảo trì](#13-bảo-mật--bảo-trì)
 14. [Phụ lục: không dùng API key (.p8)](#14-phụ-lục-không-dùng-api-key-p8)
+15. [Phụ lục: so sánh với workflow mẫu (DGF Connect Admin)](#15-phụ-lục-so-sánh-với-workflow-mẫu-dgf-connect-admin)
 
 ---
 
@@ -486,3 +487,66 @@ Nếu không muốn dùng `.p8`, có thể thay bằng **Apple ID + app-specific
      ```
 
    - Bỏ bước `Init certificates` / input `init_certs` (đã làm ở bước 1 trên Mac).
+
+## 15. Phụ lục: so sánh với workflow mẫu (DGF Connect Admin)
+
+Workflow của laboro được xây dựng dựa trên workflow CI của project **DGF Connect Admin** (repo public `dgf-connect-admin-ci`). Mục này ghi lại những điểm giống/khác và lý do, để khi chỉnh sửa có thể tham khảo.
+
+### 15.1 Điểm giống nhau
+
+- Mô hình: source trên GitLab, repo GitHub riêng chỉ chứa workflow, trigger bằng `repository_dispatch` (`event_type: deploy`).
+- Runner clone source từ GitLab theo tag bằng `gitlab-ci-token:${GITLAB_DEPLOY_TOKEN}` và `GITLAB_REPO_PATH`.
+- Job Android chạy trên `ubuntu-latest`, job iOS chạy trên `macos-26`.
+- Dùng chung tên secret: `ANDROID_KEYSTORE_BASE64`, `ANDROID_KEYSTORE_PASSWORD`, `ANDROID_KEY_ALIAS`, `ANDROID_KEY_PASSWORD`, `GOOGLE_PLAY_SERVICE_ACCOUNT_JSON`, `APP_STORE_ISSUER_ID`, `ENV_FILE_DEV`, `ENV_FILE_PROD`, `GITLAB_DEPLOY_TOKEN`, `GITLAB_REPO_PATH`.
+- Payload có `tag` và `platform` (`ios` | `android` | `both`); tag có hậu tố flavor `-dev` / `-prod`.
+
+### 15.2 Điểm khác nhau
+
+Khác biệt cốt lõi: **DGF để logic build/ký/upload trong source GitLab** (Fastfile, Gemfile, ExportOptions plist nằm trong repo app), workflow chỉ gọi lane. **Laboro để toàn bộ logic trong workflow** (tự sinh Fastfile và ExportOptions.plist lúc chạy) vì repo laboro chưa có fastlane.
+
+| Hạng mục | DGF Connect Admin | Laboro | Lý do |
+| --- | --- | --- | --- |
+| Trigger | Chỉ `repository_dispatch` (từ `deploy.sh` local hoặc GitLab CI) | `repository_dispatch` + `workflow_dispatch` (nút Run workflow) | Cần chạy tay để tạo chứng chỉ lần đầu (`init_certs`), deploy lại tag, đổi track. Trên repo public chỉ người có quyền write mới bấm được |
+| Payload | `tag`, `flavor`, `version`, `build_number`, `platform`; thiếu thì tách từ tag | `tag`, `platform`, `android_track`; version / build number / flavor **luôn** tách từ tag | Một nguồn sự thật duy nhất là tag, tránh lệch giữa tag và payload |
+| Kiểm tra tag | Không | Regex `^v\d+\.\d+\.\d+\+\d+-(dev\|prod)$`, sai là dừng | Bắt lỗi sớm thay vì build hỏng giữa chừng |
+| Parse tag | Lặp lại trong 2 job | Job `params` riêng, 2 job dùng chung output | Tránh trùng lặp |
+| Flavor | Flavor thật: `--flavor`, scheme riêng, `ExportOptions_<flavor>.plist` | Không có flavor native; `dev` → `config/development.json`, `prod` → `config/production.json` | Laboro chưa cấu hình flavor/scheme; phân môi trường bằng `--dart-define-from-file` |
+| Env file | `.env` → `assets/env/.env.<flavor>` | **JSON** → `config/<env>.json`; `ENV_FILE_DEV` trống thì dùng file đã commit | Theo cấu trúc `config/` sẵn có của laboro |
+| Flutter version | Viết cứng `3.41.7` | Đọc từ `.fvmrc` | Không bị lệch với phiên bản dev dùng local |
+| Clone | Full clone rồi `git checkout <tag>` | `git clone --depth 1 --branch <tag>` | Nhanh hơn |
+| Fastlane | Fastfile + Gemfile trong source, `bundle exec` | Fastfile sinh trong workflow, `gem install fastlane` | Laboro không có fastlane trong repo |
+| `flutter pub run` | Có (đã deprecated) | `dart run` | Lệnh mới |
+| `gen-l10n` | Không | Có | Laboro dùng l10n sinh code |
+| Android build | Lane `android deploy_<flavor>` trong repo | `flutter build appbundle` + ký qua `android.injected.signing.*` trong `~/.gradle/gradle.properties` | Không cần sửa `build.gradle.kts` |
+| Android upload | Lane fastlane (`upload_to_play_store`) | Action `r0adkll/upload-google-play@v1` | Không cần fastlane cho Android |
+| Android track | Cố định trong Fastfile | Mặc định `internal`, chọn được qua `android_track` | Linh hoạt khi promote |
+| Ký iOS | Lane `prepare_<flavor>` trong repo; credential **không nằm trong GitHub secrets** (nhiều khả năng commit trong source) | `match` readonly, chứng chỉ trong repo certs riêng, credential trong secrets | Không để key/cert trong source code |
+| API key App Store | Chỉ `APP_STORE_ISSUER_ID` trong secrets (Key ID + `.p8` nằm trong source) | `APP_STORE_ISSUER_ID` + `APP_STORE_KEY_ID` + `APP_STORE_KEY_P8_BASE64` | Như trên |
+| Secrets match | Không có | `MATCH_GIT_URL`, `MATCH_GIT_BASIC_AUTHORIZATION`, `MATCH_PASSWORD` | Match cần truy cập và giải mã repo certs |
+| Tạo chứng chỉ lần đầu | Ngoài CI | Input `init_certs` chạy `match` (readonly: false) trên runner macOS | Không cần máy Mac |
+| CocoaPods | Bước `pod install --repo-update` riêng | Không có | `flutter build ipa` tự chạy pod install; repo chưa có `Podfile` |
+| Xcode | `xcode-select` cứng `Xcode_26.4.1`, chạy **sau** bước signing | `maxim-lobanov/setup-xcode` `latest-stable`, chạy **đầu tiên** | Image runner cập nhật sẽ gỡ phiên bản cũ; mọi bước nên dùng cùng một Xcode |
+| Build & export IPA | `flutter build ipa` rồi `xcodebuild -exportArchive` riêng | `flutter build ipa --export-options-plist=...` (một lệnh) | Gọn hơn, cùng kết quả |
+| ExportOptions | `ios/ExportOptions_<flavor>.plist` trong repo | Sinh trong workflow từ `APPLE_TEAM_ID` + `IOS_BUNDLE_ID` | Không cần file trong repo |
+| Bundle ID | Trong project | Ghi đè bằng `update_code_signing_settings(bundle_identifier:)` theo `IOS_BUNDLE_ID` | Workflow và profile match luôn khớp nhau |
+| Điều kiện chạy iOS | `platform != 'android'` (payload thiếu `platform` vẫn chạy iOS) | `platform` mặc định `both`, so khớp tường minh | Rõ ràng hơn |
+| Script injection | Chèn `${{ github.event.client_payload.* }}` thẳng vào `run:` | Truyền qua `env:` rồi dùng `"$VAR"` | Payload chứa ký tự đặc biệt không thể chạy lệnh tuỳ ý |
+| Timeout | Không | `timeout-minutes` 40 (Android) / 45 (iOS) | Build treo không ăn hết quota macOS |
+| Concurrency | Không | Cùng tag thì huỷ run cũ | Tránh upload trùng build number |
+| Checkout CI repo | `actions/checkout` repo CI | Không | Workflow không cần file nào khác trong repo CI |
+
+### 15.3 Tương thích khi dùng lại công cụ của DGF
+
+- `deploy.sh` hoặc job GitLab của DGF gửi thêm `flavor`, `version`, `build_number`: workflow laboro **bỏ qua** các trường này. Tag vẫn phải đúng định dạng `v<version>+<build>-<dev|prod>`.
+- `ENV_FILE_DEV` / `ENV_FILE_PROD` của DGF ở định dạng `.env`; của laboro phải là **JSON**. Không copy giá trị secret giữa hai repo.
+- Secret là theo từng repo: keystore, service account, env file, API key của DGF **không dùng được** cho laboro.
+
+### 15.4 Nếu muốn chuyển sang kiểu DGF
+
+Khi laboro có flavor native hoặc logic deploy phức tạp hơn, có thể chuyển logic vào source GitLab:
+
+1. Tạo `ios/Gemfile`, `ios/fastlane/Fastfile` (copy nội dung heredoc trong bước `Write fastlane files`), `ios/ExportOptions.plist` trong repo laboro và commit.
+2. Xoá bước `Write fastlane files`; đổi `gem install fastlane` thành `ruby/setup-ruby` với `working-directory: source/ios` + `bundler-cache: true`, và gọi `bundle exec fastlane ...`.
+3. Với flavor native: tạo scheme `dev` / `prod` trong Xcode và `productFlavors` trong `build.gradle.kts`, thêm `--flavor $FLAVOR` vào lệnh build, tách ExportOptions theo flavor.
+4. Giữ nguyên các cải tiến an toàn: kiểm tra tag, truyền payload qua `env:`, `timeout-minutes`, `concurrency`, credential trong secrets.
+
